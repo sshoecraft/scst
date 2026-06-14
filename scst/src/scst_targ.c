@@ -5354,6 +5354,80 @@ static bool __scst_check_unblock_aborted_cmd(struct scst_cmd *cmd, struct list_h
 	return res;
 }
 
+/*
+ * dev_lock supposed to be held and IRQs disabled.
+ *
+ * Reclaims an aborted command that is parked waiting on SCSI atomic blockers,
+ * i.e. one that is on dev_exec_cmd_list with scsi_atomic_blockers > 0. Such
+ * commands are NOT on blocked_cmd_list or deferred_cmd_list, so the walks in
+ * __scst_unblock_aborted_cmds() would never wake them: their only reactivation
+ * path is scst_check_unblock_scsi_atomic_cmds() when each blocker completes. If
+ * a blocker is itself parked/aborted (e.g. mass NEXUS_LOSS under a CAW storm),
+ * the command is orphaned forever - it stays parked, holding its tgt_dev/conn
+ * refcounts, which wedges the device and leaves iscsi_conn_cleanup spinning.
+ *
+ * Detach the aborted command from its blockers and re-activate it so it can run
+ * to abnormal completion and release everything it holds. Safe because an
+ * aborted command never executes - it only finishes.
+ *
+ * Returns true if the command was reclaimed.
+ */
+static bool __scst_check_unblock_aborted_scsi_atomic_cmd(struct scst_cmd *cmd)
+{
+	struct scst_device *dev = cmd->dev;
+	struct scst_cmd *blocker;
+
+	if (!test_bit(SCST_CMD_ABORTED, &cmd->cmd_flags))
+		return false;
+
+	if (cmd->scsi_atomic_blockers == 0)
+		return false;
+
+	/*
+	 * Remove cmd from every blocker's blocked array, so that a later
+	 * scst_check_unblock_scsi_atomic_cmds() for that blocker can't
+	 * dereference cmd after it has been freed. The blocked array invariant
+	 * (non-NULL <=> count > 0) must be preserved, otherwise the blocker's
+	 * completion would hit the EXTRACHECKS_BUG_ON(count == 0) there.
+	 */
+	list_for_each_entry(blocker, &dev->dev_exec_cmd_list,
+			    dev_exec_cmd_list_entry) {
+		int i, j = 0;
+
+		if (blocker == cmd || blocker->scsi_atomic_blocked_cmds == NULL)
+			continue;
+
+		for (i = 0; i < blocker->scsi_atomic_blocked_cmds_count; i++) {
+			if (blocker->scsi_atomic_blocked_cmds[i] == cmd) {
+				cmd->scsi_atomic_blockers--;
+				continue;
+			}
+			blocker->scsi_atomic_blocked_cmds[j++] =
+				blocker->scsi_atomic_blocked_cmds[i];
+		}
+
+		blocker->scsi_atomic_blocked_cmds_count = j;
+		if (j == 0) {
+			kfree(blocker->scsi_atomic_blocked_cmds);
+			blocker->scsi_atomic_blocked_cmds = NULL;
+		}
+	}
+
+	/*
+	 * All blockers of a parked command are still on dev_exec_cmd_list (a
+	 * blocker only drops its hold by completing, which decrements
+	 * scsi_atomic_blockers), so the walk above must have cleared it.
+	 */
+	EXTRACHECKS_WARN_ON(cmd->scsi_atomic_blockers != 0);
+
+	spin_lock(&cmd->cmd_threads->cmd_list_lock);
+	list_add_tail(&cmd->cmd_list_entry, &cmd->cmd_threads->active_cmd_list);
+	wake_up(&cmd->cmd_threads->cmd_list_waitQ);
+	spin_unlock(&cmd->cmd_threads->cmd_list_lock);
+
+	return true;
+}
+
 void __scst_unblock_aborted_cmds(const struct scst_tgt *tgt, const struct scst_session *sess,
 				 const struct scst_device *device)
 {
@@ -5382,6 +5456,25 @@ void __scst_unblock_aborted_cmds(const struct scst_tgt *tgt, const struct scst_s
 			if (__scst_check_unblock_aborted_cmd(cmd, &cmd->blocked_cmd_list_entry,
 							     true))
 				TRACE_MGMT_DBG("Unblock aborted blocked cmd %p", cmd);
+		}
+
+		/*
+		 * Commands parked waiting on SCSI atomic blockers (CAW/RESERVE
+		 * overlap) live only on dev_exec_cmd_list, not on the lists
+		 * walked above, so they need their own reclaim pass - otherwise
+		 * an aborted one whose blocker never completes is orphaned and
+		 * permanently wedges the device.
+		 */
+		list_for_each_entry_safe(cmd, tcmd, &dev->dev_exec_cmd_list,
+					 dev_exec_cmd_list_entry) {
+			if (tgt && tgt != cmd->tgt)
+				continue;
+			if (sess && sess != cmd->sess)
+				continue;
+
+			if (__scst_check_unblock_aborted_scsi_atomic_cmd(cmd))
+				TRACE_MGMT_DBG("Unblock aborted atomic-blocked cmd %p",
+					       cmd);
 		}
 		local_irq_enable_nort();
 		spin_unlock_bh(&dev->dev_lock);

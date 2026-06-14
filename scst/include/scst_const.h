@@ -50,7 +50,15 @@
 #define SCST_VERSION_CODE		SCST_VERSION(3, 11, 0, 0)
 
 #define SCST_VERSION_NAME		"3.11.0-pre"
-#define SCST_VERSION_STRING_SUFFIX
+/*
+ * Derivative patch marker. Bump the trailing number for each fix in this
+ * fork so the running version string (dmesg / sysfs) identifies the build.
+ * .1 - reclaim aborted SCSI-atomic-blocked cmds on NEXUS_LOSS/abort
+ *      (fixes permanent device wedge + iscsi_conn_cleanup kthread leak under
+ *       the concurrent CAW storm; see scst_targ.c
+ *       __scst_check_unblock_aborted_scsi_atomic_cmd).
+ */
+#define SCST_VERSION_STRING_SUFFIX	"+caw-abort-reclaim.1"
 #define SCST_VERSION_STRING		SCST_VERSION_NAME SCST_VERSION_STRING_SUFFIX
 
 #ifdef SCST_BUILD_DATE
